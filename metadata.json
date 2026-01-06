@@ -1,0 +1,5 @@
+{
+  "name": "AI Medium Article Publisher",
+  "description": "An automated AI blog manager that finds trending topics, generates claymation visuals, writes articles with unique twists, and helps you publish to Medium and LinkedIn.",
+  "requestFramePermissions": []
+}
