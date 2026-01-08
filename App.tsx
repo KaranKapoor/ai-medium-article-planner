@@ -1,8 +1,15 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
-import { AppState, BlogPost } from './types';
-import { generateTrendingTopics, generatePostContent, generateClaymationImage } from './services/geminiService';
+import { AppState, BlogPost, ExpandedGoal } from './types';
+import { 
+  generateTrendingTopics, 
+  generatePostContent, 
+  generateClaymationImage,
+  sanitizeContent,
+  scoreContent,
+  expandPostContent
+} from './services/geminiService';
 import PostCard from './components/PostCard';
-import { Sparkles, Linkedin, FileText, Loader2, Send, RotateCcw, PenTool, Download, Copy, ExternalLink, ArrowRight, X } from 'lucide-react';
+import { Sparkles, Linkedin, FileText, Loader2, Send, RotateCcw, PenTool, Download, Copy, ExternalLink, ArrowRight, X, Image as ImageIcon } from 'lucide-react';
 
 const INITIAL_STATE: AppState = {
   step: 'idle',
@@ -53,43 +60,63 @@ const App: React.FC = () => {
         progress: { current: 10, total: 100, message: 'Topics found! Starting creative engine...' }
       }));
 
-      // 2. Generate Content & Images for each post
+      // 2. Process Content: Generate Draft -> Score (Sanitize moved to Finalize)
       const updatedPosts = [...initialPosts];
       const totalSteps = initialPosts.length;
 
       for (let i = 0; i < totalSteps; i++) {
         const post = updatedPosts[i];
         
-        post.status = 'generating';
+        // Start Main Image Generation in parallel
+        const imagePromise = generateClaymationImage(post);
+
+        // --- Step A: Text Generation (Draft) ---
         setState(prev => ({ 
           ...prev, 
-          posts: [...updatedPosts], 
           progress: { 
-            current: 10 + ((i / totalSteps) * 90), // Scale from 10% to 100%
+            current: 10 + ((i / totalSteps) * 90), 
             total: 100, 
-            message: `Generating post ${i + 1} of ${totalSteps}: ${post.title}...` 
+            message: `Drafting post ${i + 1}/${totalSteps}: "${post.title}"...` 
           } 
         }));
+        
+        let content = await generatePostContent(post);
+        let currentPostData = { ...post, ...content };
 
-        const [content, imageUrl] = await Promise.all([
-          generatePostContent(post),
-          generateClaymationImage(post)
-        ]);
+        // --- Step B: Scoring ---
+        // We score the draft to help the user choose.
+        setState(prev => ({ 
+          ...prev, 
+          progress: { 
+            current: 10 + ((i / totalSteps) * 90), 
+            total: 100, 
+            message: `Scoring quality for post ${i + 1}...` 
+          } 
+        }));
+        
+        const score = await scoreContent(currentPostData as BlogPost);
+
+        // --- Step C: Visuals (Await parallel promise) ---
+        const imageUrl = await imagePromise;
 
         updatedPosts[i] = {
-          ...post,
-          ...content,
+          ...currentPostData,
+          score,
           imageUrl,
           status: 'completed'
-        };
+        } as BlogPost;
 
         setState(prev => ({ ...prev, posts: [...updatedPosts] }));
       }
 
+      // --- Step D: Sorting ---
+      updatedPosts.sort((a, b) => (b.score || 0) - (a.score || 0));
+
       setState(prev => ({
         ...prev,
         step: 'review',
-        progress: { current: 100, total: 100, message: 'All done!' }
+        posts: updatedPosts,
+        progress: { current: 100, total: 100, message: 'All done! Ranked by Quality Score.' }
       }));
 
     } catch (error) {
@@ -102,71 +129,109 @@ const App: React.FC = () => {
     }
   };
 
-  const handlePublishSetup = () => {
-    if (!state.selectedPostId) return;
-    setState(prev => ({ ...prev, step: 'published' }));
-    setTimeout(() => {
+  const handleFinalizePost = async () => {
+    const post = state.posts.find(p => p.id === state.selectedPostId);
+    if (!post) return;
+
+    setState(prev => ({ 
+      ...prev, 
+      step: 'finalizing', 
+      progress: { current: 0, total: 100, message: 'Expanding content and generating goal images...' } 
+    }));
+
+    try {
+      // 1. Expand Goals (Detailed text & Image prompts)
+      setState(prev => ({ ...prev, progress: { current: 20, total: 100, message: 'Deepening architectural insights...' } }));
+      const expandedGoals = await expandPostContent(post);
+
+      // 2. Generate Images for Expanded Goals (Parallel)
+      setState(prev => ({ ...prev, progress: { current: 40, total: 100, message: 'Sculpting claymation visuals for each goal...' } }));
+      
+      const goalsWithImagesPromise = expandedGoals.map(async (goal) => {
+        const imageUrl = await generateClaymationImage(post, goal.imagePrompt);
+        return { ...goal, imageUrl };
+      });
+
+      const finalGoals = await Promise.all(goalsWithImagesPromise);
+      
+      // Explicitly type as BlogPost to avoid narrowing 'expandedGoals' to a type where imageUrl is required.
+      // This ensures compatibility when reassigning 'finalizedPost' with sanitized content (where imageUrl is optional).
+      let finalizedPost: BlogPost = {
+        ...post,
+        expandedGoals: finalGoals
+      };
+
+      // 3. Sanitize Everything (Summary, Expanded Goals, Conclusion)
+      setState(prev => ({ ...prev, progress: { current: 80, total: 100, message: 'Final safety and inclusivity check...' } }));
+      const sanitizedContent = await sanitizeContent(finalizedPost);
+      
+      finalizedPost = { ...finalizedPost, ...sanitizedContent };
+
+      // Update state with finalized post
+      const newPosts = state.posts.map(p => p.id === post.id ? finalizedPost : p);
+
+      setState(prev => ({
+        ...prev,
+        posts: newPosts,
+        step: 'published',
+        progress: { current: 100, total: 100, message: 'Ready for publication!' }
+      }));
+      
+      setTimeout(() => {
         window.scrollTo({ top: 0, behavior: 'smooth' });
-    }, 100);
+      }, 100);
+
+    } catch (error) {
+      console.error(error);
+      setState(prev => ({ 
+        ...prev, 
+        step: 'review', // Go back to review on error
+        error: error instanceof Error ? error.message : "Failed to finalize post." 
+      }));
+    }
   };
 
   const selectedPost = state.posts.find(p => p.id === state.selectedPostId);
 
   const getMarkdownContent = () => {
     if (!selectedPost) return '';
-    return `# ${selectedPost.title}
+    
+    let md = `# ${selectedPost.title}\n\n`;
+    md += `![Main Image](${selectedPost.imageUrl})\n\n`;
+    md += `## Summary\n${selectedPost.summary}\n\n`;
+    
+    if (selectedPost.expandedGoals) {
+      selectedPost.expandedGoals.forEach((goal, i) => {
+        md += `### ${i+1}. ${goal.title}\n`;
+        md += `![Goal ${i+1} Image](${goal.imageUrl})\n\n`;
+        md += `${goal.content}\n\n`;
+      });
+    } else {
+      md += `## Key Takeaways\n${selectedPost.goals.map((g, i) => `${i + 1}. ${g}`).join('\n')}\n\n`;
+    }
 
-![${selectedPost.twist}](${selectedPost.title} Image)
-
-## Summary
-${selectedPost.summary}
-
-## Key Takeaways
-${selectedPost.goals.map((goal, i) => `${i + 1}. ${goal}`).join('\n')}
-
-## Conclusion
-${selectedPost.conclusion}
-`;
+    md += `## Conclusion\n${selectedPost.conclusion}\n`;
+    return md;
   };
 
   const handleCopyMarkdown = async () => {
     const md = getMarkdownContent();
     try {
       await navigator.clipboard.writeText(md);
-      showToast("Article Markdown copied to clipboard!");
+      showToast("Full Article Markdown copied!");
     } catch (err) {
-      showToast("Failed to copy. Please try manually.", "error");
+      showToast("Failed to copy.", "error");
     }
   };
 
-  const handleDownloadImage = () => {
-    if (!selectedPost?.imageUrl) return;
+  const handleDownloadImage = (url: string | undefined, name: string) => {
+    if (!url) return;
     const link = document.createElement('a');
-    link.href = selectedPost.imageUrl;
-    link.download = `claymation-${selectedPost.id}.png`;
+    link.href = url;
+    link.download = `${name}.png`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-    showToast("Image downloading started.");
-  };
-
-  const handleLinkedInShare = async () => {
-    if (!selectedPost) return;
-
-    const text = `🚀 Just published a new article on AI & ${selectedPost.twist}: "${selectedPost.title}"\n\n${selectedPost.summary.substring(0, 150)}...\n\nKey Insights:\n${selectedPost.goals.map(g => `• ${g}`).join('\n')}\n\n#AI #Innovation #TechTrends #ClaymationBlogger`;
-    
-    try {
-      await navigator.clipboard.writeText(text);
-      showToast("Post text copied! Opening LinkedIn...", "success");
-      
-      // Slight delay to ensure toast is seen and clipboard is set
-      setTimeout(() => {
-        // Opens the LinkedIn "Start a Post" dialog directly
-        window.open('https://www.linkedin.com/feed/?shareActive=true', '_blank');
-      }, 500);
-    } catch (err) {
-      showToast("Failed to copy text for LinkedIn.", "error");
-    }
   };
 
   const handleReset = () => {
@@ -256,8 +321,8 @@ ${selectedPost.conclusion}
           </div>
         )}
 
-        {/* LOADING STATE */}
-        {(state.step === 'generating_topics' || state.step === 'generating_content') && (
+        {/* LOADING STATE (Draft or Finalizing) */}
+        {(state.step === 'generating_topics' || state.step === 'generating_content' || state.step === 'finalizing') && (
           <div className="text-center py-20">
             <div className="mb-8 relative max-w-lg mx-auto">
               <div className="flex justify-between text-xs text-gray-500 mb-1">
@@ -273,25 +338,31 @@ ${selectedPost.conclusion}
               <p className="mt-4 text-gray-600 font-medium animate-pulse">{state.progress.message}</p>
             </div>
             
-            {/* Grid preview while loading - Removed blur during generation so user can see progress */}
-            <div className={`
-              grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-6 transition-all
-              ${state.step === 'generating_topics' ? 'opacity-50 filter blur-sm pointer-events-none' : 'opacity-100'}
-            `}>
-               {state.posts.length > 0 ? state.posts.map(post => (
-                 <PostCard 
-                   key={post.id} 
-                   post={post} 
-                   isSelected={false} 
-                   onSelect={() => {}} 
-                   isReviewMode={false} 
-                 />
-               )) : Array(5).fill(0).map((_, i) => (
-                 <div key={i} className="h-96 bg-white rounded-xl shadow border border-gray-100 flex items-center justify-center">
-                    <span className="text-gray-300">...</span>
-                 </div>
-               ))}
-            </div>
+            {state.step === 'finalizing' ? (
+               <div className="max-w-md mx-auto text-gray-500 italic">
+                 Finalizing your selection. This involves deep writing, multiple image generations, and safety checks. Please wait...
+               </div>
+            ) : (
+              /* Grid preview while loading drafts */
+              <div className={`
+                grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-6 transition-all
+                ${state.step === 'generating_topics' ? 'opacity-50 filter blur-sm pointer-events-none' : 'opacity-100'}
+              `}>
+                 {state.posts.length > 0 ? state.posts.map(post => (
+                   <PostCard 
+                     key={post.id} 
+                     post={post} 
+                     isSelected={false} 
+                     onSelect={() => {}} 
+                     isReviewMode={false} 
+                   />
+                 )) : Array(5).fill(0).map((_, i) => (
+                   <div key={i} className="h-96 bg-white rounded-xl shadow border border-gray-100 flex items-center justify-center">
+                      <span className="text-gray-300">...</span>
+                   </div>
+                 ))}
+              </div>
+            )}
           </div>
         )}
 
@@ -300,7 +371,7 @@ ${selectedPost.conclusion}
           <div className="space-y-8" ref={scrollRef}>
             <div className="text-center mb-10">
               <h2 className="text-3xl font-bold text-gray-900">Today's Selection</h2>
-              <p className="text-gray-600 mt-2">Select the best article to publish today.</p>
+              <p className="text-gray-600 mt-2">Select the best article to publish today (Ranked by Quality Score).</p>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-3 gap-8 justify-center">
@@ -323,7 +394,7 @@ ${selectedPost.conclusion}
                 {state.selectedPostId ? "One article selected" : "Please select an article"}
               </span>
               <button
-                onClick={handlePublishSetup}
+                onClick={handleFinalizePost}
                 disabled={!state.selectedPostId}
                 className={`
                   inline-flex items-center px-8 py-3 border border-transparent text-base font-medium rounded-lg shadow-sm text-white 
@@ -331,7 +402,7 @@ ${selectedPost.conclusion}
                   transition-colors
                 `}
               >
-                Prepare for Publication
+                Expand & Finalize Publication
                 <ArrowRight className="ml-2 h-5 w-5" />
               </button>
             </div>
@@ -340,56 +411,78 @@ ${selectedPost.conclusion}
 
         {/* PUBLISHED / READY STATE */}
         {state.step === 'published' && selectedPost && (
-          <div className="max-w-4xl mx-auto bg-white rounded-2xl shadow-xl overflow-hidden animate-fade-in-up border border-indigo-100 mb-10">
+          <div className="max-w-5xl mx-auto bg-white rounded-2xl shadow-xl overflow-hidden animate-fade-in-up border border-indigo-100 mb-10">
             <div className="bg-gradient-to-r from-indigo-600 to-purple-600 px-6 py-8 text-center">
               <div className="mx-auto flex items-center justify-center h-16 w-16 rounded-full bg-white/20 backdrop-blur mb-4">
                 <FileText className="h-8 w-8 text-white" />
               </div>
               <h2 className="text-3xl font-bold text-white">Publication Package Ready</h2>
               <p className="text-indigo-100 mt-2 max-w-lg mx-auto">
-                Due to Medium's security policies, please manually copy the content to their editor.
+                Full article expanded, visualized, and sanitized. Ready for distribution.
               </p>
             </div>
             
             <div className="p-8">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-8 mb-8">
-                {/* Visual Asset */}
-                <div className="space-y-4">
-                  <h3 className="font-bold text-gray-900 flex items-center gap-2">
-                    <span className="bg-indigo-100 text-indigo-800 w-6 h-6 rounded-full flex items-center justify-center text-xs">1</span>
-                    Visual Asset
-                  </h3>
-                  <div className="rounded-lg overflow-hidden border border-gray-200 shadow-sm">
-                    <img src={selectedPost.imageUrl} alt="Thumbnail" className="w-full h-48 object-cover" />
-                  </div>
-                  <button 
-                    onClick={handleDownloadImage}
-                    className="w-full flex items-center justify-center px-4 py-2 border border-gray-300 shadow-sm text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50 transition-colors"
-                  >
-                    <Download className="mr-2 h-4 w-4" /> Download Image
-                  </button>
+              {/* Main Article Preview */}
+              <div className="mb-10 border-b border-gray-200 pb-10">
+                <div className="flex justify-between items-center mb-6">
+                   <h1 className="text-3xl font-bold text-gray-900">{selectedPost.title}</h1>
+                   <div className="flex gap-2">
+                      <button 
+                        onClick={handleCopyMarkdown}
+                        className="flex items-center px-4 py-2 border border-gray-300 text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50"
+                      >
+                        <Copy className="mr-2 h-4 w-4" /> Copy All MD
+                      </button>
+                   </div>
                 </div>
 
-                {/* Content Asset */}
-                <div className="space-y-4">
-                  <h3 className="font-bold text-gray-900 flex items-center gap-2">
-                    <span className="bg-indigo-100 text-indigo-800 w-6 h-6 rounded-full flex items-center justify-center text-xs">2</span>
-                    Content Asset
-                  </h3>
-                  <div className="bg-gray-50 p-4 rounded-lg border border-gray-200 h-48 overflow-y-auto text-xs font-mono text-gray-600">
-                    {getMarkdownContent()}
+                <div className="prose max-w-none text-gray-800">
+                  <div className="relative rounded-xl overflow-hidden mb-6 shadow-md group">
+                     <img src={selectedPost.imageUrl} alt="Main" className="w-full max-h-[400px] object-cover" />
+                     <button 
+                        onClick={() => handleDownloadImage(selectedPost.imageUrl, 'main-image')}
+                        className="absolute bottom-4 right-4 bg-white/90 text-gray-900 px-3 py-1 rounded shadow-sm text-sm font-medium opacity-0 group-hover:opacity-100 transition-opacity"
+                     >
+                       <Download size={14} className="inline mr-1" /> Save
+                     </button>
                   </div>
-                  <button 
-                    onClick={handleCopyMarkdown}
-                    className="w-full flex items-center justify-center px-4 py-2 border border-gray-300 shadow-sm text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50 transition-colors"
-                  >
-                    <Copy className="mr-2 h-4 w-4" /> Copy Markdown
-                  </button>
+                  
+                  <h3 className="text-xl font-bold mb-2">Summary</h3>
+                  <p className="mb-6 leading-relaxed article-text">{selectedPost.summary}</p>
+                  
+                  <div className="space-y-12">
+                     {selectedPost.expandedGoals?.map((goal, idx) => (
+                       <div key={idx} className="bg-gray-50 p-6 rounded-xl border border-gray-100">
+                          <h3 className="text-2xl font-bold text-indigo-900 mb-4 flex items-center gap-3">
+                            <span className="w-8 h-8 rounded-full bg-indigo-100 flex items-center justify-center text-sm">{idx + 1}</span>
+                            {goal.title}
+                          </h3>
+                          <div className="flex flex-col md:flex-row gap-6 items-start">
+                             <div className="w-full md:w-1/3 flex-shrink-0 relative group">
+                                <img src={goal.imageUrl} alt={goal.title} className="w-full rounded-lg shadow-sm border border-gray-200" />
+                                <button 
+                                  onClick={() => handleDownloadImage(goal.imageUrl, `goal-${idx+1}`)}
+                                  className="absolute bottom-2 right-2 bg-white/90 text-gray-900 px-2 py-1 rounded shadow-sm text-xs font-medium opacity-0 group-hover:opacity-100 transition-opacity"
+                                >
+                                  <Download size={12} className="inline mr-1" /> Save
+                                </button>
+                             </div>
+                             <div className="w-full md:w-2/3">
+                                <p className="text-lg leading-relaxed article-text text-gray-700">{goal.content}</p>
+                             </div>
+                          </div>
+                       </div>
+                     ))}
+                  </div>
+
+                  <h3 className="text-xl font-bold mt-8 mb-2">Conclusion</h3>
+                  <p className="leading-relaxed article-text">{selectedPost.conclusion}</p>
                 </div>
               </div>
 
               {/* Action Steps */}
-              <div className="border-t border-gray-100 pt-8">
+              <div>
                  <h3 className="font-bold text-gray-900 mb-6 text-center">Finalize Publication</h3>
                  
                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4 max-w-2xl mx-auto">
@@ -402,17 +495,17 @@ ${selectedPost.conclusion}
                     </button>
 
                     <button 
-                      onClick={handleLinkedInShare}
+                      onClick={() => {
+                        const shareText = `🚀 New Article: ${selectedPost.title}\n\n${selectedPost.summary.substring(0, 150)}...\n\nRead more... #AI #Tech`;
+                        navigator.clipboard.writeText(shareText);
+                        window.open('https://www.linkedin.com/feed/?shareActive=true', '_blank');
+                      }}
                       className="flex items-center justify-center px-6 py-4 border border-transparent text-base font-medium rounded-lg text-white bg-[#0077b5] hover:bg-[#006396] transition-colors shadow-lg transform active:scale-95"
                     >
                       <Linkedin className="mr-2 h-5 w-5" />
                       Share on LinkedIn
                     </button>
                  </div>
-                 <p className="text-center text-gray-500 text-sm mt-4 px-4">
-                   Click "Share on LinkedIn" to copy the post text and open the LinkedIn editor. 
-                   <br/>You may need to allow popups for this site.
-                 </p>
               </div>
 
               <div className="pt-8 mt-8 border-t border-gray-100 text-center">

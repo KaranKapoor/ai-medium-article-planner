@@ -1,6 +1,6 @@
 import React from 'react';
 import { BlogPost } from '../types';
-import { CheckCircle, Clock, BookOpen, Share2 } from 'lucide-react';
+import { CheckCircle, Clock, BookOpen, Share2, Award } from 'lucide-react';
 
 interface PostCardProps {
   post: BlogPost;
@@ -40,6 +40,14 @@ const PostCard: React.FC<PostCardProps> = ({ post, isSelected, onSelect, isRevie
         <div className="absolute top-2 right-2 bg-black/50 backdrop-blur-md text-white text-xs px-2 py-1 rounded-full">
           {post.twist}
         </div>
+
+        {/* Score Badge */}
+        {post.score !== undefined && (
+          <div className="absolute top-2 left-2 bg-yellow-400 text-yellow-900 text-xs font-bold px-2 py-1 rounded-full shadow-md flex items-center gap-1">
+            <Award size={12} />
+            <span>Score: {post.score}/10</span>
+          </div>
+        )}
       </div>
 
       {/* Content Section */}
@@ -84,10 +92,12 @@ const PostCard: React.FC<PostCardProps> = ({ post, isSelected, onSelect, isRevie
         )}
       </div>
 
-      {/* Selection Overlay (Mobile friendly check) */}
+      {/* Selection Overlay */}
       {isSelected && (
-        <div className="absolute top-2 left-2 bg-indigo-600 text-white rounded-full p-1 shadow-lg z-10">
-          <CheckCircle size={24} />
+        <div className="absolute inset-0 bg-indigo-900/10 z-10 flex items-center justify-center">
+           <div className="bg-indigo-600 text-white rounded-full p-2 shadow-xl transform scale-125">
+             <CheckCircle size={32} />
+           </div>
         </div>
       )}
     </div>

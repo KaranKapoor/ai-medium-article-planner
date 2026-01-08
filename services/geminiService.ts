@@ -1,5 +1,5 @@
 import { GoogleGenAI, Type } from "@google/genai";
-import { BlogPost } from "../types";
+import { BlogPost, ExpandedGoal } from "../types";
 
 // Initialize Gemini Client
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
@@ -163,19 +163,212 @@ export const generatePostContent = async (post: BlogPost): Promise<Partial<BlogP
 };
 
 /**
- * Step 3: Generate a Claymation Image for the post
+ * Step 3: Expand Content (New Step: Detail out Goals)
  */
-export const generateClaymationImage = async (post: BlogPost): Promise<string> => {
+export const expandPostContent = async (post: BlogPost): Promise<ExpandedGoal[]> => {
+  const model = "gemini-3-flash-preview";
+
+  const prompt = `
+    You are expanding a technical blog post.
+    Title: ${post.title}
+    
+    Take the following 3 Key Goals (short bullet points) and expand each into a detailed, insightful paragraph (100-150 words each).
+    
+    Current Goals:
+    ${post.goals.map((g, i) => `${i+1}. ${g}`).join('\n')}
+
+    **INSTRUCTIONS:**
+    1. **Content:** Write simple, clear, but architecturally deep explanations for each goal. Explain "Why this matters" and "How to apply it".
+    2. **Images:** For EACH goal, provide a creative, abstract "Claymation" image prompt description that represents that specific concept visually. 
+       - The image prompt should specify "Polymer clay texture, stop-motion style".
+       - It should be a visual metaphor for the goal.
+
+    Return JSON.
+  `;
+
+  const response = await ai.models.generateContent({
+    model,
+    contents: prompt,
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.ARRAY,
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            title: { type: Type.STRING, description: "The original goal title" },
+            content: { type: Type.STRING, description: "The detailed paragraph" },
+            imagePrompt: { type: Type.STRING, description: "The prompt to generate the claymation image" }
+          },
+          required: ["title", "content", "imagePrompt"]
+        }
+      }
+    }
+  });
+
+  return JSON.parse(response.text || "[]");
+};
+
+/**
+ * Step 4: Content Sanitizer (Runs LAST)
+ */
+export const sanitizeContent = async (post: BlogPost): Promise<Partial<BlogPost>> => {
+  const model = "gemini-3-flash-preview";
+  
+  // Construct text to check including expanded goals if they exist
+  let contentToCheck = `
+    Summary: ${post.summary}
+    Conclusion: ${post.conclusion}
+  `;
+  
+  if (post.expandedGoals) {
+    post.expandedGoals.forEach((g, i) => {
+      contentToCheck += `\nGoal ${i+1} (${g.title}): ${g.content}`;
+    });
+  } else {
+    contentToCheck += `\nGoals: ${post.goals.join('; ')}`;
+  }
+
+  const prompt = `
+    You are a Content Safety & Inclusivity Editor. Review the following blog post components.
+
+    **Components to Review:**
+    ${contentToCheck}
+
+    **Your Mission:**
+    1. Check for profanity, bad words, or offensive language.
+    2. Check for phrases that might hurt religious sentiments.
+    3. Check for language that might marginalize groups or cause emotional harm.
+    4. Ensure the tone remains positive and professional.
+
+    **Action:**
+    - If issues are found, rewrite the specific sections to be safer, inclusive, and positive.
+    - If NO issues are found, return the content exactly as is.
+
+    Return JSON format matching the structure of the input (Summary, Goals/ExpandedGoals, Conclusion).
+  `;
+
+  // We need a dynamic schema based on whether expandedGoals exist
+  const hasExpanded = !!post.expandedGoals;
+
+  const schema = {
+    type: Type.OBJECT,
+    properties: {
+      summary: { type: Type.STRING },
+      conclusion: { type: Type.STRING },
+      ...(hasExpanded ? {
+        expandedGoals: {
+          type: Type.ARRAY,
+          items: {
+             type: Type.OBJECT,
+             properties: {
+               title: { type: Type.STRING },
+               content: { type: Type.STRING },
+             },
+             required: ["title", "content"]
+          }
+        }
+      } : {
+        goals: { 
+          type: Type.ARRAY, 
+          items: { type: Type.STRING }
+        }
+      })
+    },
+    required: ["summary", "conclusion", hasExpanded ? "expandedGoals" : "goals"],
+  };
+
+  const response = await ai.models.generateContent({
+    model,
+    contents: prompt,
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: schema,
+    },
+  });
+
+  const result = JSON.parse(response.text || "{}");
+  
+  // Merge result back. If expandedGoals were sanitized, we need to preserve the imagePrompts/Urls which aren't in the sanitizer output
+  if (hasExpanded && result.expandedGoals && post.expandedGoals) {
+     const mergedGoals = post.expandedGoals.map((original, index) => ({
+        ...original,
+        title: result.expandedGoals[index]?.title || original.title,
+        content: result.expandedGoals[index]?.content || original.content
+     }));
+     return {
+       summary: result.summary,
+       conclusion: result.conclusion,
+       expandedGoals: mergedGoals
+     };
+  }
+
+  return result;
+};
+
+/**
+ * Step 5: Content Scoring
+ */
+export const scoreContent = async (post: BlogPost): Promise<number> => {
+  const model = "gemini-3-flash-preview";
+
+  const prompt = `
+    Act as a strict editorial board member. Score the following blog post out of 10.
+
+    **Article Data:**
+    Title: ${post.title}
+    Twist: ${post.twist}
+    Summary: ${post.summary}
+    Goals: ${post.goals.join('; ')}
+    Conclusion: ${post.conclusion}
+
+    **Scoring Criteria:**
+    1. **Uniqueness & Novelty:** Is this a new thought or a cliche?
+    2. **Quality of Idea:** Is the architectural reasoning sound?
+    3. **Value to Society:** Does it help us build better, safer, or more ethical systems?
+    4. **Knowledge Gain:** Will the reader actually learn something new?
+    5. **Future Vision:** Is this idea ahead of its time?
+
+    Analyze these factors and produce a single aggregate score from 0 to 10.
+    10 = Perfect, paradigm-shifting masterpiece.
+    0 = Complete garbage.
+
+    Return JSON: { "score": number }
+  `;
+
+  const response = await ai.models.generateContent({
+    model,
+    contents: prompt,
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          score: { type: Type.NUMBER },
+        },
+        required: ["score"],
+      },
+    },
+  });
+
+  const result = JSON.parse(response.text || '{"score": 5}');
+  return result.score;
+};
+
+/**
+ * Step 6: Generate Claymation Image
+ */
+export const generateClaymationImage = async (post: BlogPost, customPrompt?: string): Promise<string> => {
   // Using gemini-2.5-flash-image for standard generation
   const model = "gemini-2.5-flash-image"; 
 
-  const prompt = `Generate an image.
+  const finalPrompt = customPrompt || `Generate an image.
     Create a highly detailed, artistic claymation style image for a blog post titled "${post.title}".
     
     **Concept:** The image must visualize the abstract architectural twist: "${post.twist}".
     
-    **Visual Metaphors to explore (Pick one based on the twist):**
-    - "Agents as Microservices": Clay robots tangled in strings (representing dependency hell).
+    **Visual Metaphors to explore:**
+    - "Agents as Microservices": Clay robots tangled in strings.
     - "Emergent Intelligence": Clay ants building a complex digital cathedral.
     - "Quantum/Observer": A clay figure looking at a box, and the box changing shape.
     - "Tech Debt": A beautiful clay futuristic tower built on a crumbling clay foundation.
@@ -189,7 +382,7 @@ export const generateClaymationImage = async (post: BlogPost): Promise<string> =
     const response = await ai.models.generateContent({
       model,
       contents: {
-        parts: [{ text: prompt }]
+        parts: [{ text: finalPrompt }]
       },
       config: {
         imageConfig: {
@@ -207,16 +400,10 @@ export const generateClaymationImage = async (post: BlogPost): Promise<string> =
       }
     }
     
-    // Log text if available for debugging why image wasn't generated
-    const textPart = response.candidates?.[0]?.content?.parts?.find(p => p.text);
-    if (textPart) {
-      console.warn("Model returned text instead of image:", textPart.text);
-    }
-    
     throw new Error("No image data found in response");
   } catch (error) {
     console.error("Image generation failed:", error);
     // Return a placeholder if generation fails to avoid crashing the whole flow
-    return `https://picsum.photos/seed/${encodeURIComponent(post.id)}/800/450?grayscale`; 
+    return `https://picsum.photos/seed/${Math.random()}/800/450?grayscale`; 
   }
 };
